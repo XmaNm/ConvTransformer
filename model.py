@@ -32,6 +32,28 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
+class SpatialGate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        gate = torch.sigmoid(self.conv(x))
+        return x * gate
+
+
+class TemporalGate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.fc = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        # x: [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        pooled = x.mean(dim=[3,4])  # global pooling
+        gate = torch.sigmoid(self.fc(pooled))  # [B, T, C]
+        gate = gate.unsqueeze(-1).unsqueeze(-1)
+        return x * gate
 class ConvAttention(nn.Module):
     def __init__(self,configs):
         super(ConvAttention, self).__init__()
@@ -181,38 +203,43 @@ def feature_embedding(img, configs):
     gen_img = torch.stack(gen_img, dim=-1)
     return gen_img
 
-class Transformer(nn.Module):
-    def __init__(self, configs, dim=3, depth=3, mlp_dim=5, heads=3, dropout=0.5):
+class SpatioTemporalConvTransformer(nn.Module):
+    def __init__(self, dim=64):
         super().__init__()
-        self.configs = configs
-        self.num_hidden = [int(x) for x in self.configs.num_hidden.split(',')]
-        self.pos_embedding = PositionalEncoding(self.configs)
-        self.Encoder = Encoder(dim, depth, heads, mlp_dim, dropout)
-        self.Decoder = Decoder(dim,depth, heads, mlp_dim, dropout)
-        self.back_to_pixel = nn.Sequential(
-            nn.Conv2d(self.num_hidden[-1],1,kernel_size=1)
+        self.encoder_cnn = ImageEncoder(1, dim)
+
+        self.temporal_gate = TemporalGate(dim)
+
+        self.encoder = Encoder(dim)
+        self.decoder = Decoder(dim)
+
+        self.head = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(dim, 1, 1)
         )
-    def forward(self, frames, mask = None):
-        b,n,h,w,l = frames.shape
-        out_list=[]
-        feature_map = self.feature_embedding(img=frames,configs=self.configs)
-        enc_in = self.pos_embedding(feature_map)
-        enc_out = self.Encoder(enc_in)
-        # TODO decide which one is the query: feature_map or frames
-        dec_out = self.Decoder(enc_in,enc_out)
-        for i in l:
-            out_list.append(self.back_to_pixel(dec_out[...,i]))
-        x = torch.stack(out_list,dim=-1)
-        return x
 
-    def feature_embedding(self,img, configs):
-        generator = feature_generator(configs).to(configs.device)
-        gen_img = []
-        for i in range(img.shape[-1]):
-            gen_img.append(generator(img[:, :, :, :, i]))
-        gen_img = torch.stack(gen_img, dim=-1)
-        return gen_img
+    def forward(self, x):
+        # x: [B, T, 1, H, W]
+        B, T, C, H, W = x.shape
 
+        feats = []
+        for t in range(T):
+            f = self.encoder_cnn(x[:, t])
+            feats.append(f)
+
+        feats = torch.stack(feats, dim=1)  # [B, T, C, H, W]
+
+        feats = self.temporal_gate(feats)
+
+        # 取最后一帧作为query
+        enc_feat = feats[:, -1]
+
+        enc_out = self.encoder(enc_feat)
+        dec_out = self.decoder(enc_out, enc_out)
+
+        out = self.head(dec_out)
+        return out
 
 class Attention(nn.Module):
     def __init__(self, dim, heads = 8, dropout = 0.):
