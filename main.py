@@ -1,6 +1,6 @@
 from model import *
 
-net = Transformer()
+net = SpatioTemporalConvTransformer()
 import torch.optim as optim
 
 loss_function = nn.CrossEntropyLoss()
